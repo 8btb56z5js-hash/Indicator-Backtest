@@ -1,0 +1,389 @@
+//@version=6
+indicator("DCS Institutional Framework v4.6 MODIFIED", shorttitle="DCS v4.6 MOD", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=50)
+
+// ═══════════════════════════════════════════════════════════════
+// DCS INSTITUTIONAL FRAMEWORK v4.6 - MODIFIED
+// Changes from original:
+// - Simplified parameter set (removed redundant inputs)
+// - Fixed missing visual inputs
+// - Streamlined conflict governor
+// - Pure indicator (no strategy logic)
+// ═══════════════════════════════════════════════════════════════
+
+// === INPUTS ===
+grpCore = "Core Engine"
+i_auto = input.bool(true, "Auto-adjust by timeframe", group=grpCore)
+i_fast = input.int(14, "Fast EMA", minval=2, group=grpCore)
+i_mid = input.int(21, "Mid EMA", minval=3, group=grpCore)
+i_slow = input.int(55, "Slow EMA", minval=5, group=grpCore)
+i_atr_len = input.int(14, "ATR Length", minval=5, group=grpCore)
+i_vol_len = input.int(20, "Participation Length", minval=5, group=grpCore)
+
+grpRegime = "Market State"
+i_er_len = input.int(21, "Efficiency Length", minval=8, group=grpRegime)
+i_comp_len = input.int(60, "Compression Lookback", minval=20, group=grpRegime)
+i_swing = input.int(20, "Structure Lookback", minval=5, group=grpRegime)
+i_htf_mode = input.string("Auto", "Higher Timeframe", options=["Auto", "15", "30", "60", "240", "D", "W"], group=grpRegime)
+i_regime_persist = input.int(5, "Regime persistence bars", minval=1, maxval=20, group=grpRegime)
+
+grpExec = "Execution Control"
+i_min_exec = input.int(75, "Approved execution score", minval=50, maxval=95, group=grpExec)
+i_min_candidate = input.int(58, "Candidate setup score", minval=35, maxval=90, group=grpExec)
+i_chase_atr = input.float(1.8, "Max chase distance from mean", minval=0.5, maxval=5.0, step=0.1, group=grpExec)
+i_target_r = input.float(1.8, "Primary target R", minval=0.8, maxval=5.0, step=0.1, group=grpExec)
+i_stop_atr = input.float(0.45, "Invalidation ATR buffer", minval=0.1, maxval=2.0, step=0.05, group=grpExec)
+i_cooldown = input.int(8, "Approved signal cooldown", minval=1, group=grpExec)
+i_entry_window = input.int(10, "Entry window bars", minval=2, maxval=50, group=grpExec)
+i_entry_cancel_score = input.int(45, "Cancel entry below execution score", minval=20, maxval=70, group=grpExec)
+i_armed_min = input.int(66, "Armed setup score", minval=45, maxval=90, group=grpExec)
+i_max_zone_pct = input.float(4.0, "Max entry zone width %", minval=0.5, maxval=15.0, step=0.25, group=grpExec)
+i_allow_micro = input.bool(true, "Adaptive low-price handling", group=grpExec)
+
+grpGovern = "Conflict Governor (Simplified)"
+i_flip_lock_bars = input.int(16, "Opposite-direction lock bars", minval=3, maxval=80, group=grpGovern)
+i_flip_margin = input.int(14, "Required flip score margin", minval=6, maxval=35, group=grpGovern)
+i_flip_atr = input.float(0.35, "Required flip distance from mean ATR", minval=0.05, maxval=1.50, step=0.05, group=grpGovern)
+
+grpVisual = "Visual"
+i_show_dash = input.bool(true, "Show execution dashboard", group=grpVisual)
+i_dash_pos = input.string("Top Right", "Dashboard position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=grpVisual)
+i_show_bg = input.bool(true, "Show regime background", group=grpVisual)
+i_bg_strength = input.int(98, "Background transparency", minval=80, maxval=98, group=grpVisual)
+i_show_bands = input.bool(true, "Show adaptive bands", group=grpVisual)
+i_show_mean = input.bool(true, "Show execution mean", group=grpVisual)
+i_show_levels = input.bool(true, "Show active entry/invalid/target", group=grpVisual)
+
+// === COLORS ===
+colBull = color.rgb(0, 210, 120)
+colBear = color.rgb(255, 82, 82)
+colWarn = color.rgb(255, 210, 0)
+colInfo = color.rgb(0, 188, 212)
+colText = color.rgb(220, 225, 235)
+colMuted = color.rgb(150, 155, 165)
+colPanel = color.rgb(18, 22, 28)
+colPanel2 = color.rgb(37, 42, 50)
+colHead = color.rgb(45, 51, 62)
+colBorder = color.rgb(70, 76, 88)
+
+// === HELPER FUNCTIONS ===
+f_reason_ui(string reason) =>
+    string out = reason
+    if reason == "Participation Cap"
+        out := "Volume cap"
+    else if reason == "Regime Cap"
+        out := "Regime cap"
+    else if reason == "Noise Cap"
+        out := "Noise cap"
+    else if reason == "Mean Failure"
+        out := "Failed to hold mean"
+    else if reason == "Failed Follow-Through"
+        out := "Weak follow-through"
+    else if reason == "Opposite Pressure"
+        out := "Opposite pressure"
+    else if reason == "Regime Flip"
+        out := "Regime shifted"
+    else if reason == "Participation Risk"
+        out := "Weak participation"
+    else if reason == "Chase Risk"
+        out := "Too extended to chase"
+    else if reason == "Directional Lock"
+        out := "HTF conflict"
+    else if reason == "Repeat Idea"
+        out := "Signal already issued"
+    else if reason == "Bull/Bear Conflict"
+        out := "Mixed signals"
+    else if reason == "Volatility Risk"
+        out := "Volatility risk"
+    else if reason == "HTF Conflict"
+        out := "HTF conflict"
+    else if reason == "Poor R/R"
+        out := "Poor reward/risk"
+    else if reason == "Imprecise Entry"
+        out := "Entry zone imprecise"
+    else if reason == "Entry Window"
+        out := "Entry window active"
+    else if reason == "Approved"
+        out := "Trade approved"
+    else if reason == "Waiting"
+        out := "Trigger pending"
+    else if reason == "No Setup"
+        out := "No setup yet"
+    else if reason == "Healthy"
+        out := "Trade healthy"
+    out
+
+// === AUTO TIMEFRAME ADAPTATION ===
+tfSec = timeframe.in_seconds(timeframe.period)
+isUltraFastTf = tfSec <= 60
+isFastTf = tfSec <= 900
+isMidTf = tfSec > 900 and tfSec <= 3600
+pFast = i_auto ? (isFastTf ? 13 : isMidTf ? 14 : 21) : i_fast
+pMid = i_auto ? (isFastTf ? 21 : isMidTf ? 34 : 55) : i_mid
+pSlow = i_auto ? (isFastTf ? 55 : isMidTf ? 89 : 144) : i_slow
+pAtrLen = i_auto ? (isFastTf ? 14 : isMidTf ? 14 : 21) : i_atr_len
+pVolLen = i_auto ? (isFastTf ? 20 : isMidTf ? 30 : 40) : i_vol_len
+pSwing = i_auto ? (isFastTf ? 14 : isMidTf ? 20 : 30) : i_swing
+pErLen = i_auto ? (isFastTf ? 14 : isMidTf ? 21 : 34) : i_er_len
+pCompLen = i_auto ? (isFastTf ? 60 : isMidTf ? 75 : 100) : i_comp_len
+autoHtf = tfSec <= 300 ? "15" : tfSec <= 900 ? "60" : tfSec <= 3600 ? "240" : tfSec <= 14400 ? "D" : "W"
+htf = i_htf_mode == "Auto" ? autoHtf : i_htf_mode
+
+// === CORE SERIES ===
+emaFast = ta.ema(close, pFast)
+emaMid = ta.ema(close, pMid)
+emaSlow = ta.ema(close, pSlow)
+atr = ta.atr(pAtrLen)
+atrPct = atr / math.max(close, syminfo.mintick)
+volAvg = ta.sma(volume, pVolLen)
+bandMult = atrPct > 0.08 ? 2.8 : atrPct > 0.04 ? 2.4 : atrPct > 0.02 ? 2.1 : 1.8
+upperBand = emaMid + atr * bandMult
+lowerBand = emaMid - atr * bandMult
+c1 = close[1]
+o1 = open[1]
+h1 = high[1]
+l1 = low[1]
+v1 = volume[1]
+emaFast1 = emaFast[1]
+emaMid1 = emaMid[1]
+atr1 = atr[1]
+atrPct1 = atrPct[1]
+volAvg1 = volAvg[1]
+upperBand1 = upperBand[1]
+lowerBand1 = lowerBand[1]
+range1 = high[1] - low[1]
+body1 = math.abs(close[1] - open[1])
+bodyEff1 = range1 > 0 ? body1 / range1 : 0.0
+upperWick1 = high[1] - math.max(open[1], close[1])
+lowerWick1 = math.min(open[1], close[1]) - low[1]
+
+// === HIGHER TIMEFRAME CONTEXT ===
+htfFast = request.security(syminfo.tickerid, htf, ta.ema(close, pFast)[1], lookahead=barmerge.lookahead_off)
+htfMid = request.security(syminfo.tickerid, htf, ta.ema(close, pMid)[1], lookahead=barmerge.lookahead_off)
+htfSlow = request.security(syminfo.tickerid, htf, ta.ema(close, pSlow)[1], lookahead=barmerge.lookahead_off)
+htfClose = request.security(syminfo.tickerid, htf, close[1], lookahead=barmerge.lookahead_off)
+htfBull = htfClose > htfMid and htfFast > htfMid and htfMid >= htfSlow
+htfBear = htfClose < htfMid and htfFast < htfMid and htfMid <= htfSlow
+htfNeutral = not htfBull and not htfBear
+
+// === MARKET STATE FEATURES ===
+directionalMove = math.abs(c1 - close[pErLen + 1])
+pathMove = 0.0
+for n = 1 to pErLen
+    pathMove += math.abs(close[n] - close[n + 1])
+efficiency = pathMove > 0 ? directionalMove / pathMove : 0.0
+bandWidthSeries = (upperBand - lowerBand) / math.max(close, syminfo.mintick)
+atrAvg = ta.sma(atr, pVolLen)
+bandWidth = bandWidthSeries[1]
+bandWidthAvg = ta.sma(bandWidthSeries, pCompLen)[1]
+bandWidthLow = ta.lowest(bandWidthSeries, pCompLen)[1]
+atrAvg1 = atrAvg[1]
+compressionIntensity = bandWidthAvg > bandWidthLow ? 1.0 - ((bandWidth - bandWidthLow) / math.max(bandWidthAvg - bandWidthLow, 0.000001)) : 0.0
+compressionIntensityClamped = math.max(0.0, math.min(1.0, compressionIntensity))
+volExpansion = atr1 > atrAvg1 * 1.25
+volCompression = compressionIntensityClamped > 0.55 and atr1 < atrAvg1 * 1.05
+bullTrend = c1 > emaMid1 and emaFast1 > emaMid1
+bearTrend = c1 < emaMid1 and emaFast1 < emaMid1
+trendStability = efficiency > 0.34 and (bullTrend or bearTrend)
+rangeState = efficiency < 0.22 and not volExpansion
+exhaustionLong = c1 > upperBand1 and bodyEff1 < 0.45 and upperWick1 > body1 * 0.65
+exhaustionShort = c1 < lowerBand1 and bodyEff1 < 0.45 and lowerWick1 > body1 * 0.65
+regimeTrend = trendStability
+regimeCompression = volCompression and not trendStability
+regimeExpansion = volExpansion and efficiency > 0.28
+regimeExhaustion = exhaustionLong or exhaustionShort
+regimeRange = rangeState and not regimeCompression
+regimeName = regimeExhaustion ? "Exhaustion" : regimeCompression ? "Compression" : regimeExpansion ? "Expansion" : regimeTrend ? "Trend" : regimeRange ? "Range" : "Mixed"
+regimeColor = regimeExhaustion ? colWarn : regimeCompression ? colWarn : regimeExpansion ? colInfo : regimeTrend ? colBull : regimeRange ? colMuted : colWarn
+regimeId = regimeExhaustion ? 5 : regimeCompression ? 4 : regimeExpansion ? 3 : regimeTrend ? 2 : regimeRange ? 1 : 0
+
+// === STRUCTURE / LIQUIDITY FEATURES ===
+swingHigh = ta.highest(high, pSwing)[2]
+swingLow = ta.lowest(low, pSwing)[2]
+volRatio = volAvg1 > 0 ? v1 / volAvg1 : 1.0
+lowPriceBehavior = i_allow_micro and c1 < 5.0
+highVolatilityBehavior = atrPct1 > (lowPriceBehavior ? 0.055 : 0.028)
+thinParticipation = lowPriceBehavior ? volRatio < 1.15 : volRatio < 0.75
+qualityParticipation = lowPriceBehavior ? volRatio >= 1.35 : volRatio >= 0.90
+liquidityShock = lowPriceBehavior and range1 > atr1 * 2.4 and bodyEff1 < 0.55
+momentumBull = c1 > o1 and c1 > emaFast1 and emaFast1 >= emaFast[2]
+momentumBear = c1 < o1 and c1 < emaFast1 and emaFast1 <= emaFast[2]
+displacementBull = c1 > o1 and bodyEff1 >= 0.55 and range1 > atr1 * 0.80
+displacementBear = c1 < o1 and bodyEff1 >= 0.55 and range1 > atr1 * 0.80
+pullbackLongZone = bullTrend and l1 <= emaFast1 + atr1 * 0.35 and c1 >= emaFast1 and c1 > o1
+pullbackShortZone = bearTrend and h1 >= emaFast1 - atr1 * 0.35 and c1 <= emaFast1 and c1 < o1
+breakoutLong = c1 > swingHigh and displacementBull and qualityParticipation
+breakdownShort = c1 < swingLow and displacementBear and qualityParticipation
+reclaimLong = c1 > emaMid1 and close[2] <= emaMid[2] and displacementBull
+rejectShort = c1 < emaMid1 and close[2] >= emaMid[2] and displacementBear
+continuationRetestLong = bullTrend and (htfBull or htfNeutral) and c1 > emaMid1 and l1 <= emaFast1 + atr1 * 0.70 and c1 <= upperBand1 and bodyEff1 <= 0.72
+continuationRetestShort = bearTrend and (htfBear or htfNeutral) and c1 < emaMid1 and h1 >= emaFast1 - atr1 * 0.70 and c1 >= lowerBand1 and bodyEff1 <= 0.72
+candidateLongRaw = pullbackLongZone or breakoutLong or reclaimLong or continuationRetestLong
+candidateShortRaw = pullbackShortZone or breakdownShort or rejectShort or continuationRetestShort
+
+// === BULL / BEAR EVIDENCE ===
+bullStructure = bullTrend ? 18 : c1 > emaMid1 ? 10 : 0
+bearStructure = bearTrend ? 18 : c1 < emaMid1 ? 10 : 0
+bullMomentum = momentumBull ? 14 : 0
+bearMomentum = momentumBear ? 14 : 0
+bullDisplacement = displacementBull ? 10 : 0
+bearDisplacement = displacementBear ? 10 : 0
+bullHtf = htfBull ? 14 : htfNeutral and c1 > emaMid1 ? 7 : 0
+bearHtf = htfBear ? 14 : htfNeutral and c1 < emaMid1 ? 7 : 0
+bullLiquidity = qualityParticipation and c1 > o1 ? 12 : thinParticipation ? 0 : 6
+bearLiquidity = qualityParticipation and c1 < o1 ? 12 : thinParticipation ? 0 : 6
+bullRegime = regimeTrend and bullTrend ? 12 : regimeCompression and breakoutLong ? 12 : regimeExpansion and c1 > emaMid1 ? 8 : regimeRange ? 3 : 5
+bearRegime = regimeTrend and bearTrend ? 12 : regimeCompression and breakdownShort ? 12 : regimeExpansion and c1 < emaMid1 ? 8 : regimeRange ? 3 : 5
+bullScore = bullStructure + bullMomentum + bullDisplacement + bullHtf + bullLiquidity + bullRegime
+bearScore = bearStructure + bearMomentum + bearDisplacement + bearHtf + bearLiquidity + bearRegime
+evidenceConflict = bullScore > 45 and bearScore > 35 or bearScore > 45 and bullScore > 35
+biasLong = bullScore > bearScore + 8
+biasShort = bearScore > bullScore + 8
+biasName = biasLong ? "Buy Side" : biasShort ? "Sell Side" : "Neutral"
+biasColor = biasLong ? colBull : biasShort ? colBear : colWarn
+contextLongScore = math.max(0, math.min(100, bullScore))
+contextShortScore = math.max(0, math.min(100, bearScore))
+contextScore = biasLong ? contextLongScore : biasShort ? contextShortScore : math.max(contextLongScore, contextShortScore)
+
+// === ENTRY QUALITY ===
+distFromMean = math.abs(c1 - emaMid1) / math.max(atr1, syminfo.mintick)
+longChaseRisk = c1 > emaMid1 and distFromMean > i_chase_atr
+shortChaseRisk = c1 < emaMid1 and distFromMean > i_chase_atr
+longPremium = c1 > upperBand1 or longChaseRisk
+shortPremium = c1 < lowerBand1 or shortChaseRisk
+longEntryQuality = pullbackLongZone ? 22 : continuationRetestLong and not longPremium ? 18 : breakoutLong and not longPremium ? 18 : reclaimLong and not longPremium ? 16 : 6
+shortEntryQuality = pullbackShortZone ? 22 : continuationRetestShort and not shortPremium ? 18 : breakdownShort and not shortPremium ? 18 : rejectShort and not shortPremium ? 16 : 6
+longCandidateScore = bullScore + longEntryQuality
+shortCandidateScore = bearScore + shortEntryQuality
+
+// === RISK ENGINE ===
+controlledLongPullback = biasLong and c1 >= emaMid1 - atr1 * 0.15 and c1 <= upperBand1 and range1 <= atr1 * 1.35 and not liquidityShock
+controlledShortPullback = biasShort and c1 <= emaMid1 + atr1 * 0.15 and c1 >= lowerBand1 and range1 <= atr1 * 1.35 and not liquidityShock
+riskParticipationLong = thinParticipation and not controlledLongPullback or liquidityShock
+riskParticipationShort = thinParticipation and not controlledShortPullback or liquidityShock
+riskConflict = evidenceConflict
+riskVolatility = highVolatilityBehavior and not qualityParticipation
+riskHtfLong = htfBear and not breakoutLong
+riskHtfShort = htfBull and not breakdownShort
+candidateLong = candidateLongRaw and biasLong and longCandidateScore >= i_min_candidate
+candidateShort = candidateShortRaw and biasShort and shortCandidateScore >= i_min_candidate
+entryLongLow = breakoutLong ? swingHigh : math.min(emaFast1, emaMid1 + atr1 * 0.20)
+entryLongHigh = breakoutLong ? swingHigh + atr1 * 0.25 : emaFast1 + atr1 * 0.30
+entryShortHigh = breakdownShort ? swingLow : math.max(emaFast1, emaMid1 - atr1 * 0.20)
+entryShortLow = breakdownShort ? swingLow - atr1 * 0.25 : emaFast1 - atr1 * 0.30
+entryMidLong = (entryLongLow + entryLongHigh) / 2.0
+entryMidShort = (entryShortLow + entryShortHigh) / 2.0
+invalidLong = math.min(swingLow, l1) - atr1 * i_stop_atr
+invalidShort = math.max(swingHigh, h1) + atr1 * i_stop_atr
+riskLong = math.max(entryMidLong - invalidLong, atr1 * 0.45)
+riskShort = math.max(invalidShort - entryMidShort, atr1 * 0.45)
+targetLong = entryMidLong + riskLong * i_target_r
+targetShort = entryMidShort - riskShort * i_target_r
+rrRiskLong = (targetLong - entryMidLong) / riskLong < 1.2
+rrRiskShort = (entryMidShort - targetShort) / riskShort < 1.2
+entryZonePctLong = (entryLongHigh - entryLongLow) / math.max(c1, syminfo.mintick) * 100.0
+entryZonePctShort = (entryShortHigh - entryShortLow) / math.max(c1, syminfo.mintick) * 100.0
+adaptiveZoneLimit = lowPriceBehavior ? math.max(i_max_zone_pct, 7.0) : highVolatilityBehavior ? math.max(i_max_zone_pct, 5.0) : i_max_zone_pct
+riskImpreciseLong = entryZonePctLong > adaptiveZoneLimit or (entryLongHigh - entryLongLow) > atr1 * 1.35
+riskImpreciseShort = entryZonePctShort > adaptiveZoneLimit or (entryShortHigh - entryShortLow) > atr1 * 1.35
+
+// === DIRECTIONAL MEMORY (SIMPLIFIED) ===
+var int lastApprovedBar = na
+var int lastResolvedDir = 0
+var int lastResolvedBar = na
+sameIdeaBars = isUltraFastTf ? 50 : tfSec <= 300 ? 38 : tfSec <= 900 ? 28 : 18
+hasLastIdea = not na(lastResolvedBar) and bar_index - lastResolvedBar <= sameIdeaBars
+postOppositeLock = not na(lastResolvedBar) and bar_index - lastResolvedBar <= i_flip_lock_bars
+bullFlipConfirmed = c1 > emaMid1 + atr1 * i_flip_atr and bullScore > bearScore + i_flip_margin and displacementBull and not riskHtfLong
+bearFlipConfirmed = c1 < emaMid1 - atr1 * i_flip_atr and bearScore > bullScore + i_flip_margin and displacementBear and not riskHtfShort
+directionLockLong = postOppositeLock and lastResolvedDir == -1 and not bullFlipConfirmed
+directionLockShort = postOppositeLock and lastResolvedDir == 1 and not bearFlipConfirmed
+longBlock = riskParticipationLong or riskConflict or riskVolatility or riskHtfLong or rrRiskLong or riskImpreciseLong or directionLockLong
+shortBlock = riskParticipationShort or riskConflict or riskVolatility or riskHtfShort or rrRiskShort or riskImpreciseShort or directionLockShort
+longExecutionScore = math.max(0, math.min(100, longCandidateScore - (riskParticipationLong ? 14 : 0) - (riskConflict ? 10 : 0) - (riskVolatility ? 10 : 0) - (riskHtfLong ? 10 : 0) - (rrRiskLong ? 8 : 0) - (riskImpreciseLong ? 12 : 0) - (directionLockLong ? 14 : 0)))
+shortExecutionScore = math.max(0, math.min(100, shortCandidateScore - (riskParticipationShort ? 14 : 0) - (riskConflict ? 10 : 0) - (riskVolatility ? 10 : 0) - (riskHtfShort ? 10 : 0) - (rrRiskShort ? 8 : 0) - (riskImpreciseShort ? 12 : 0) - (directionLockShort ? 14 : 0)))
+currentLongSetupName = breakoutLong ? "Breakout Long" : reclaimLong ? "Reclaim Long" : continuationRetestLong ? "Retest Long" : "Pullback Long"
+currentShortSetupName = breakdownShort ? "Breakdown Short" : rejectShort ? "Reject Short" : continuationRetestShort ? "Retest Short" : "Pullback Short"
+
+// === APPROVAL STATE ===
+cooldownOk = na(lastApprovedBar) or bar_index - lastApprovedBar > i_cooldown
+approvedLongRaw = candidateLong and not longBlock and longExecutionScore >= i_min_exec and cooldownOk
+approvedShortRaw = candidateShort and not shortBlock and shortExecutionScore >= i_min_exec and cooldownOk
+approvedLong = approvedLongRaw
+approvedShort = approvedShortRaw
+
+if approvedLong
+    lastApprovedBar := bar_index
+    lastResolvedDir := 1
+    lastResolvedBar := bar_index
+if approvedShort
+    lastApprovedBar := bar_index
+    lastResolvedDir := -1
+    lastResolvedBar := bar_index
+
+// === DISPLAY STATE ===
+levelLongIdea = approvedLong
+levelShortIdea = approvedShort
+levelEntry = levelLongIdea ? entryMidLong : levelShortIdea ? entryMidShort : na
+levelInvalid = levelLongIdea ? invalidLong : levelShortIdea ? invalidShort : na
+levelTarget = levelLongIdea ? targetLong : levelShortIdea ? targetShort : na
+activeEntryText = levelLongIdea or levelShortIdea ? str.tostring(levelEntry, "#.##") : "No entry"
+activeExecutionScore = levelLongIdea ? longExecutionScore : levelShortIdea ? shortExecutionScore : 0
+setupName = approvedLong ? currentLongSetupName : approvedShort ? currentShortSetupName : "None"
+sideText = approvedLong ? "Long" : approvedShort ? "Short" : candidateLong ? "Long Candidate" : candidateShort ? "Short Candidate" : "None"
+sideColor = sideText == "Long" ? colBull : sideText == "Short" ? colBear : sideText == "Long Candidate" or sideText == "Short Candidate" ? colInfo : colMuted
+reasonLong = riskParticipationLong ? "Participation Risk" : riskConflict ? "Bull/Bear Conflict" : riskVolatility ? "Volatility Risk" : riskHtfLong ? "HTF Conflict" : rrRiskLong ? "Poor R/R" : riskImpreciseLong ? "Imprecise Entry" : approvedLong ? "Approved" : candidateLong ? "Waiting" : "No Setup"
+reasonShort = riskParticipationShort ? "Participation Risk" : riskConflict ? "Bull/Bear Conflict" : riskVolatility ? "Volatility Risk" : riskHtfShort ? "HTF Conflict" : rrRiskShort ? "Poor R/R" : riskImpreciseShort ? "Imprecise Entry" : approvedShort ? "Approved" : candidateShort ? "Waiting" : "No Setup"
+reasonDisplay = candidateLong ? f_reason_ui(reasonLong) : candidateShort ? f_reason_ui(reasonShort) : "No Setup"
+decisionColor = approvedLong ? colBull : approvedShort ? colBear : candidateLong or candidateShort ? colInfo : colMuted
+qualityBaseScore = activeExecutionScore
+qualityText = qualityBaseScore >= 85 ? "Elite" : qualityBaseScore >= 75 ? "Strong" : qualityBaseScore >= 65 ? "Good" : qualityBaseScore >= 55 ? "Caution" : "Avoid"
+qualityColor = qualityText == "Elite" or qualityText == "Strong" or qualityText == "Good" ? colBull : qualityText == "Caution" ? colWarn : colBear
+
+// === VISUALS ===
+plot(i_show_mean ? emaMid : na, "Execution Mean", color=color.white, linewidth=3)
+plot(i_show_bands ? upperBand : na, "Upper Adaptive Band", color=color.new(colBear, 35), linewidth=1)
+plot(i_show_bands ? lowerBand : na, "Lower Adaptive Band", color=color.new(colBull, 35), linewidth=1)
+
+var int regimePersistId = na
+var int regimePersistCount = 0
+if na(regimePersistId) or regimeId != regimePersistId
+    regimePersistId := regimeId
+    regimePersistCount := 1
+else
+    regimePersistCount += 1
+
+bgStrongEnough = contextScore >= 70 or regimeExpansion and contextScore >= 62 or regimeCompression and contextScore >= 64
+bgPersistent = regimePersistCount >= i_regime_persist
+bgColRaw = regimeCompression ? color.new(colWarn, i_bg_strength) : regimeExpansion ? color.new(colInfo, i_bg_strength) : regimeTrend and biasLong ? color.new(colBull, i_bg_strength) : regimeTrend and biasShort ? color.new(colBear, i_bg_strength) : na
+bgcolor(i_show_bg and bgPersistent and bgStrongEnough ? bgColRaw : na)
+
+plotshape(approvedLong, title="Approved Long", style=shape.diamond, location=location.belowbar, color=colBull, size=size.large, text="L", textcolor=colBull)
+plotshape(approvedShort, title="Approved Short", style=shape.diamond, location=location.abovebar, color=colBear, size=size.large, text="S", textcolor=colBear)
+plot(i_show_levels and (levelLongIdea or levelShortIdea) ? levelEntry : na, "Active Entry", color=colInfo, linewidth=2, style=plot.style_linebr)
+plot(i_show_levels and (levelLongIdea or levelShortIdea) ? levelInvalid : na, "Active Stop", color=colBear, linewidth=2, style=plot.style_linebr)
+plot(i_show_levels and (levelLongIdea or levelShortIdea) ? levelTarget : na, "Active Target", color=colBull, linewidth=2, style=plot.style_linebr)
+
+// === DASHBOARD ===
+dashPos = i_dash_pos == "Top Left" ? position.top_left : i_dash_pos == "Bottom Right" ? position.bottom_right : i_dash_pos == "Bottom Left" ? position.bottom_left : position.top_right
+if i_show_dash
+    var table dash = table.new(dashPos, 2, 7, bgcolor=colPanel, border_color=colBorder, border_width=1, frame_color=colBorder, frame_width=1)
+    table.cell(dash, 0, 0, "DCS v4.6 MOD", text_color=colText, bgcolor=colHead, text_size=size.small)
+    table.cell(dash, 1, 0, "Modified", text_color=colText, bgcolor=colHead, text_size=size.small)
+    table.cell(dash, 0, 1, "Market", text_color=colMuted, bgcolor=colPanel2, text_size=size.small)
+    table.cell(dash, 1, 1, regimeName + " / " + biasName, text_color=biasColor, bgcolor=colPanel2, text_size=size.small)
+    table.cell(dash, 0, 2, "Setup", text_color=colMuted, bgcolor=colPanel, text_size=size.small)
+    table.cell(dash, 1, 2, setupName, text_color=qualityColor, bgcolor=colPanel, text_size=size.small)
+    table.cell(dash, 0, 3, "Side", text_color=colMuted, bgcolor=colPanel2, text_size=size.small)
+    table.cell(dash, 1, 3, sideText, text_color=sideColor, bgcolor=colPanel2, text_size=size.small)
+    table.cell(dash, 0, 4, "Entry", text_color=colMuted, bgcolor=colPanel, text_size=size.small)
+    table.cell(dash, 1, 4, activeEntryText, text_color=levelLongIdea or levelShortIdea ? colInfo : colMuted, bgcolor=colPanel, text_size=size.small)
+    table.cell(dash, 0, 5, "Grade", text_color=colMuted, bgcolor=colPanel2, text_size=size.small)
+    table.cell(dash, 1, 5, qualityText + " " + str.tostring(qualityBaseScore, "#"), text_color=qualityColor, bgcolor=colPanel2, text_size=size.small)
+    table.cell(dash, 0, 6, "Status", text_color=colMuted, bgcolor=colPanel, text_size=size.small)
+    table.cell(dash, 1, 6, reasonDisplay, text_color=decisionColor, bgcolor=colPanel, text_size=size.small)
+
+// === ALERTS ===
+alertcondition(approvedLong, "DCS v4.6 Approved Long", "DCS v4.6 approved long on {{ticker}}")
+alertcondition(approvedShort, "DCS v4.6 Approved Short", "DCS v4.6 approved short on {{ticker}}")
+alertcondition(candidateLong and not approvedLong, "DCS v4.6 Long Candidate", "DCS v4.6 long candidate on {{ticker}}")
+alertcondition(candidateShort and not approvedShort, "DCS v4.6 Short Candidate", "DCS v4.6 short candidate on {{ticker}}")
