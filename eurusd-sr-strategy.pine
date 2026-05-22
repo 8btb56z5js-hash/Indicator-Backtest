@@ -1,0 +1,130 @@
+//@version=6
+strategy("HTF S/R + 1st Touch", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=2)
+
+// === INPUTS ===
+htfInput = input.timeframe("W", "Higher Timeframe (W/M)")
+lookbackYears = input.int(2, "Lookback Years for Levels")
+minTouchDistance = input.float(0.0015, "Min Touch Distance (pips)")
+
+// === HTF FUNCTIONS ===
+f_security(_symbol, _tf, _expr) => request.security(_symbol, _tf, _expr[1], lookahead=barlookahead.on_materialized)
+
+// === TRACK BROKEN LEVELS ===
+// We track: Support that broke DOWN (becomes resistance), Resistance that broke UP (becomes support)
+
+var float[] brokenSupport = array.new_float()  // Was support, now broken - becomes resistance
+var float[] brokenResistance = array.new_float() // Was resistance, now broken - becomes support
+var int[] brokenSupportTime = array.new_int()
+var int[] brokenResistanceTime = array.new_int()
+var int[] supportTouchCount = array.new_int()
+var int[] resistanceTouchCount = array.new_int()
+
+// Get HTF data
+htfClose = f_security(syminfo.tickerid, htfInput, close)
+htfHigh = f_security(syminfo.tickerid, htfInput, high)
+htfLow = f_security(syminfo.tickerid, htfInput, low)
+
+// Detect pivot breaks on HTF
+// Resistance broken UP = new support
+var bool resistanceBroken = false
+var float brokenResistanceLevel = 0
+
+// Previous swing highs/lows
+prevSwingHigh = f_security(syminfo.tickerid, htfInput, high[2])
+prevSwingLow = f_security(syminfo.tickerid, htfInput, low[2])
+
+// Check for breakouts on HTF
+// If price breaks previous resistance, it becomes support
+if (htfClose > prevSwingHigh and htfClose[1] < prevSwingHigh)
+    resistanceBroken := true
+    brokenResistanceLevel := prevSwingHigh
+    array.push(brokenResistance, prevSwingHigh)
+    array.push(brokenResistanceTime, timenow)
+    array.push(resistanceTouchCount, 0)
+
+// Support broken DOWN = new resistance
+var bool supportBroken = false
+var float brokenSupportLevel = 0
+
+if (htfClose < prevSwingLow and htfClose[1] > prevSwingLow)
+    supportBroken := true
+    brokenSupportLevel := prevSwingLow
+    array.push(brokenSupport, prevSwingLow)
+    array.push(brokenSupportTime, timenow)
+    array.push(supportTouchCount, 0)
+
+// === TOUCH DETECTION ===
+// Check if price touches a broken level for the FIRST time
+
+var bool longSignal = false
+var bool shortSignal = false
+var float signalLevel = 0
+
+// Check resistance levels (now support) - LONG setup
+for i = 0 to array.size(brokenResistance) - 1
+    level = array.get(brokenResistance, i)
+    touchCount = array.get(resistanceTouchCount, i)
+    
+    // Price is at or near level
+    dist = math.abs(close - level)
+    
+    if (dist < minTouchDistance or (low <= level and high >= level))
+        // First touch only
+        if (touchCount == 0)
+            longSignal := true
+            signalLevel := level
+            array.set(resistanceTouchCount, i, 1)
+
+// Check support levels (now resistance) - SHORT setup
+for i = 0 to array.size(brokenSupport) - 1
+    level = array.get(brokenSupport, i)
+    touchCount = array.get(supportTouchCount, i)
+    
+    dist = math.abs(close - level)
+    
+    if (dist < minTouchDistance or (low <= level and high >= level))
+        if (touchCount == 0)
+            shortSignal := true
+            signalLevel := level
+            array.set(supportTouchCount, i, 1)
+
+// === PLOTTING ===
+// Plot signal levels
+plotshape(longSignal, title="Long Signal", location=location.belowbar, color=color.green, style=shape.triangleup, size=size.large, text="LONG")
+plotshape(shortSignal, title="Short Signal", location=location.abovebar, color=color.red, style=shape.triangledown, size=size.large, text="SHORT")
+
+// Plot active levels
+for i = 0 to array.size(brokenResistance) - 1
+    level = array.get(brokenResistance, i)
+    plot(level, title="Broken Resistance (Support)", color=color.new(color.green, 70), linewidth=1, style=plot.style_line)
+
+for i = 0 to array.size(brokenSupport) - 1
+    level = array.get(brokenSupport, i)
+    plot(level, title="Broken Support (Resistance)", color=color.new(color.red, 70), linewidth=1, style=plot.style_line)
+
+// === ALERTS ===
+alertcondition(longSignal, "Long Signal", "LONG: Price hit 1st touch of broken resistance level")
+alertcondition(shortSignal, "Short Signal", "SHORT: Price hit 1st touch of broken support level")
+
+// === ENTRIES ===
+if (longSignal)
+    strategy.entry("Long", strategy.long)
+
+if (shortSignal)
+    strategy.entry("Short", strategy.short)
+
+// === EXITS ===
+exitAfterBars = input.int(10, "Exit After N Bars")
+
+// Exit on opposite signal
+if (strategy.position_size > 0 and shortSignal)
+    strategy.close("Long")
+
+if (strategy.position_size < 0 and longSignal)
+    strategy.close("Short")
+
+// Time-based exit
+if (strategy.position_size != 0)
+    for i = 1 to strategy.closedtrades
+        if (bar_index - strategy.closedtrades.entry_bar_index(strategy.closedtrades - i) >= exitAfterBars)
+            strategy.close_all()
